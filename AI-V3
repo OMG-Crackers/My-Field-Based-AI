@@ -1,0 +1,759 @@
+/*
+ * SMART QUANTUM FIELD AI — Fixed Memory & Integrated Reasoning
+ * 
+ * Compile: g++ -O3 -std=c++17 -o smart_ai smart_ai.cpp -lm -lpthread
+ * Run: ./smart_ai
+ */
+
+#include <cmath>
+#include <cstdio>
+#include <vector>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <algorithm>
+#include <random>
+#include <chrono>
+#include <queue>
+#include <fstream>
+#include <sstream>
+#include <iostream>
+#include <cstring>
+
+// ======================= CONFIG =======================
+struct Config {
+    float sigma = 0.15f;
+    float decay_rate = 0.02f;
+    float text_lr = 0.05f;
+    float text_weight_min = 0.01f;
+    int max_generation_len = 8;
+    float interaction_noise = 0.08f;
+    int causal_depth = 5;
+    int max_gp_points = 500;
+    int grid_cell = 8;
+    float concept_spread = 0.5f;
+    int confusion_thresh = 3;
+};
+Config cfg;
+
+// ======================= QUANTUM VECTOR =======================
+constexpr int QDIMS = 128;
+constexpr int IMG_W = 32, IMG_H = 32;
+
+struct QVec {
+    float d[QDIMS] = {};
+    float dist_sq(const QVec& o) const {
+        float s = 0;
+        for (int i = 0; i < QDIMS; ++i) { float x = d[i] - o.d[i]; s += x * x; }
+        return s;
+    }
+    QVec operator+(const QVec& o) const { QVec r; for (int i=0;i<QDIMS;++i) r.d[i]=d[i]+o.d[i]; return r; }
+    QVec operator-(const QVec& o) const { QVec r; for (int i=0;i<QDIMS;++i) r.d[i]=d[i]-o.d[i]; return r; }
+    QVec operator*(float s) const { QVec r; for (int i=0;i<QDIMS;++i) r.d[i]=d[i]*s; return r; }
+    QVec& operator+=(const QVec& o) { for (int i=0;i<QDIMS;++i) d[i]+=o.d[i]; return *this; }
+};
+
+// Fixed dimension indices (0‑43)
+enum Dim {
+    V_SIZE=0, V_SAT=1, V_HUE=2, V_BRIGHT=3, V_EDGES=4, V_TEX=5, V_ROUND=6, V_SYM=7, V_TRANS=8, V_SHARP=9,
+    P_W=10, P_TEMP=11, P_FRIC=12, P_TEX=13, P_TAP_S=14, P_TAP_R=15, P_SQ_R=16, P_SQ_D=17, P_SQ_SP=18, P_SQ_B=19,
+    P_PUSH_F=20, P_SLIDE_S=21, D_BRIT=22, D_TOUGH=23, D_SOFT=24, D_SLIP=25, D_DENS=26,
+    TX=27, TY=28, T_W=29, T_C=30, C_CAUSE=31, C_EFF=32, C_STR=33, TEMP_P=34, TEMP_V=35,
+    O_DROP=36, O_THROW=37, O_SQ=38, O_PUSH=39, M_FAM=40, M_EXP=41, M_CONF=42, M_SAL=43
+    // dynamic dimensions start at 44
+};
+
+// ======================= HELPER FUNCTIONS =======================
+static std::vector<std::string> split(const std::string& s) {
+    std::vector<std::string> out;
+    std::string t;
+    for (char c : s) {
+        if (c==' '||c=='\t'||c=='\n') { if(!t.empty()) out.push_back(t), t.clear(); }
+        else t += tolower(c);
+    }
+    if(!t.empty()) out.push_back(t);
+    return out;
+}
+static std::string join(const std::vector<std::string>& v, const std::string& sep) {
+    std::string r;
+    for (size_t i=0;i<v.size();++i) { if(i) r+=sep; r+=v[i]; }
+    return r;
+}
+static bool is_stop(const std::string& w) {
+    static std::unordered_set<std::string> stops = {"the","a","an","in","of","to","for","by","on","at","from","with","and","was","is","are"};
+    return stops.count(w);
+}
+
+// ======================= PIXEL & IMAGE =======================
+struct Pixel { float r,g,b; };
+struct Image {
+    Pixel px[IMG_H][IMG_W];
+    void clear(float r,float g,float b) { for(auto& row:px) for(auto& p:row) p={r,g,b}; }
+    void circle(int cx,int cy,int rad,float r,float g,float b,float a=1);
+    void rect(int x0,int y0,int x1,int y1,float r,float g,float b,float a=1);
+    void highlight(int cx,int cy,int rad,float intens);
+    void noise(std::mt19937& rng,float amt);
+};
+
+// Vision extraction (inlined from original)
+static void extract_vision(const Image& img, float bg_r,float bg_g,float bg_b, QVec& out) {
+    const float thr_sq = 0.0225f;
+    int cnt=0; float sr=0,sg=0,sb=0,sbr=0;
+    int mnx=IMG_W,mxx=0,mny=IMG_H,mxy=0;
+    for(int y=0;y<IMG_H;++y) for(int x=0;x<IMG_W;++x) {
+        const auto& p=img.px[y][x];
+        float dr=p.r-bg_r, dg=p.g-bg_g, db=p.b-bg_b;
+        if(dr*dr+dg*dg+db*db > thr_sq) {
+            ++cnt; sr+=p.r; sg+=p.g; sb+=p.b; sbr+=(p.r+p.g+p.b)/3;
+            if(x<mnx) mnx=x; if(x>mxx) mxx=x; if(y<mny) mny=y; if(y>mxy) mxy=y;
+        }
+    }
+    if(cnt<5) return;
+    float ar=sr/cnt, ag=sg/cnt, ab=sb/cnt, abr=sbr/cnt;
+    out.d[V_HUE] = [&]{ float mx=std::max({ar,ag,ab}),mn=std::min({ar,ag,ab}); if(mx-mn<1e-3f) return 0.f;
+        float h = (mx==ar)?(ag-ab)/(mx-mn) : (mx==ag)?2+(ab-ar)/(mx-mn) : 4+(ar-ag)/(mx-mn);
+        h/=6; if(h<0) h+=1; return h; }();
+    float mx=std::max({ar,ag,ab}),mn=std::min({ar,ag,ab});
+    out.d[V_SAT] = (mx>0.01f)?(mx-mn)/mx:0;
+    out.d[V_SIZE] = (float)cnt/(IMG_W*IMG_H);
+    float bv=0; for(int y=0;y<IMG_H;++y) for(int x=0;x<IMG_W;++x) {
+        const auto& p=img.px[y][x];
+        float dr=p.r-bg_r,dg=p.g-bg_g,db=p.b-bg_b;
+        if(dr*dr+dg*dg+db*db > thr_sq) { float b=(p.r+p.g+p.b)/3-abr; bv+=b*b; }
+    }
+    out.d[V_BRIGHT] = std::sqrt(bv/cnt);
+    float esum=0; int ecnt=0;
+    for(int y=1;y<IMG_H-1;++y) for(int x=1;x<IMG_W-1;++x) {
+        float gx = -img.px[y-1][x-1].r -2*img.px[y][x-1].r -img.px[y+1][x-1].r
+                   +img.px[y-1][x+1].r +2*img.px[y][x+1].r +img.px[y+1][x+1].r;
+        float gy = -img.px[y-1][x-1].r -2*img.px[y-1][x].r -img.px[y-1][x+1].r
+                   +img.px[y+1][x-1].r +2*img.px[y+1][x].r +img.px[y+1][x+1].r;
+        esum += std::sqrt(gx*gx+gy*gy); ++ecnt;
+    }
+    out.d[V_EDGES] = std::min(ecnt?esum/ecnt*3:0.f,1.f);
+    float pvs=0; int np=0;
+    for(int py=0;py<IMG_H-4;py+=4) for(int px=0;px<IMG_W-4;px+=4) {
+        float pm=0,pv=0;
+        for(int dy=0;dy<4;++dy) for(int dx=0;dx<4;++dx) pm+=(img.px[py+dy][px+dx].r+img.px[py+dy][px+dx].g+img.px[py+dy][px+dx].b)/3;
+        pm/=16;
+        for(int dy=0;dy<4;++dy) for(int dx=0;dx<4;++dx) { float b=(img.px[py+dy][px+dx].r+img.px[py+dy][px+dx].g+img.px[py+dy][px+dx].b)/3 - pm; pv+=b*b; }
+        pvs+=pv/16; ++np;
+    }
+    out.d[V_TEX] = np?std::min(std::sqrt(pvs/np)*5,1.f):0;
+    float bw=mxx-mnx+1,bh=mxy-mny+1,ba=bw*bh;
+    out.d[V_ROUND] = ba?1-(float)cnt/ba*0.5f:0;
+    float sd=0; int sc=0; int cx2=(mnx+mxx)/2;
+    for(int y=mny;y<=mxy;++y) for(int dx=1;dx<(int)(bw/2);++dx) {
+        int lx=cx2-dx, rx=cx2+dx;
+        if(lx>=0 && rx<IMG_W) {
+            const auto& pl=img.px[y][lx], &pr=img.px[y][rx];
+            float dr=pl.r-pr.r, dg=pl.g-pr.g, db=pl.b-pr.b;
+            sd+=std::sqrt(dr*dr+dg*dg+db*db); ++sc;
+        }
+    }
+    out.d[V_SYM] = sc?std::max(0.f,1-sd/sc*3):0;
+    int semi=0; for(int y=0;y<IMG_H;++y) for(int x=0;x<IMG_W;++x) {
+        const auto& p=img.px[y][x];
+        float dr=p.r-bg_r,dg=p.g-bg_g,db=p.b-bg_b;
+        float d=std::sqrt(dr*dr+dg*dg+db*db);
+        if(d>0.05f && d<0.3f) ++semi;
+    }
+    out.d[V_TRANS] = std::min((float)semi/(cnt+1)*2,1.f);
+    int se=0,we=0;
+    for(int y=1;y<IMG_H-1;++y) for(int x=1;x<IMG_W-1;++x) {
+        float gx2=img.px[y][x+1].r-img.px[y][x-1].r, gy2=img.px[y+1][x].r-img.px[y-1][x].r;
+        float m=std::sqrt(gx2*gx2+gy2*gy2);
+        if(m>0.3f) ++se; else if(m>0.05f) ++we;
+    }
+    out.d[V_SHARP] = (se+we)?(float)se/(se+we):0;
+}
+
+// ======================= PHYSICAL OBJECT =======================
+struct PhysObj {
+    std::string name,material;
+    float r,g,b,shine,tex,transp; bool round; int size;
+    float dens,yld,ult,E,elim,wall,fric,rough,snd,cor,temp;
+    float fragility() const { float t=ult*elim*wall, tn=t/5, s=E/(E+1); return std::clamp((1-tn)*s,0.f,1.f); }
+    Image render(std::mt19937& rng) const;
+};
+// render implementation after Image methods
+
+// ======================= MAIN AI CLASS =======================
+class SmartAI {
+public:
+    SmartAI() : time(0), reg_next(44) {}
+
+    // ---------- TEXT: incremental learning ----------
+    void train(const std::vector<std::pair<std::string, std::vector<std::string>>>& data) {
+        for (auto& [concept, tokens] : data) add_example(concept, tokens);
+    }
+    void add_example(const std::string& concept, const std::vector<std::string>& tokens) {
+        for (auto& w : tokens) ensure(w);
+        // update word vectors towards concept centroid
+        QVec centroid = concept_centroids[concept];
+        for (auto& w : tokens) {
+            positions[w] = positions[w] + (centroid - positions[w]) * cfg.text_lr;
+        }
+        // add tokens to concept word list
+        concept_words[concept].push_back(tokens[0]); // simplistic
+        concept_total[concept] += 1;
+        // recompute centroid
+        centroid = QVec();
+        for (auto& w : concept_words[concept]) centroid += positions[w];
+        if (concept_words[concept].size()) centroid = centroid * (1.0f/concept_words[concept].size());
+        concept_centroids[concept] = centroid;
+        // update co‑occurrence counts
+        for (auto& w : tokens) word_cprobs[w][concept] += 1.0f;
+    }
+    struct Scores { std::unordered_map<std::string,float> all; std::string best; float conf; };
+    Scores classify(const std::vector<std::string>& tokens) const {
+        Scores res;
+        QVec query; int qcnt=0;
+        for (auto& t : tokens) if (positions.count(t)) { query += positions.at(t); ++qcnt; }
+        if (qcnt==0) return res;
+        query = query * (1.0f/qcnt);
+        for (auto& [c, cen] : concept_centroids) {
+            float sim = std::exp(-query.dist_sq(cen) / (2*cfg.sigma*cfg.sigma));
+            res.all[c] = sim;
+            if (sim > res.conf) { res.conf = sim; res.best = c; }
+        }
+        return res;
+    }
+    std::vector<std::string> generate(const std::vector<std::string>& seed, int max_len=cfg.max_generation_len) {
+        std::vector<std::string> out = seed;
+        for (int step=0; step<max_len-(int)seed.size(); ++step) {
+            auto& cur = out.back();
+            if (!positions.count(cur)) break;
+            QVec curv = positions[cur];
+            std::string best; float best_sim=-1;
+            for (auto& [w,p] : positions) {
+                if (is_stop(w)) continue;
+                float sim = std::exp(-curv.dist_sq(p) / (2*cfg.sigma*cfg.sigma));
+                if (sim > best_sim && w != cur) { best_sim = sim; best = w; }
+            }
+            if (best.empty()) break;
+            out.push_back(best);
+        }
+        return out;
+    }
+
+    // ---------- VISION & PHYSICS ----------
+    void see(const std::string& name, const Image& img) {
+        ensure(name);
+        extract_vision(img, 0.4f,0.4f,0.45f, positions[name]);
+    }
+    void perceive(const std::string& name, const PhysObj& obj, std::mt19937& rng) {
+        see(name, obj.render(rng));
+        // apply physical interactions (inlined from original)
+        std::normal_distribution<float> n(0, cfg.interaction_noise);
+        auto& v = positions[name];
+        v.d[P_W] = std::clamp(obj.dens*obj.wall*0.01f + n(rng), 0.f,1.f);
+        v.d[P_TEMP] = std::clamp((obj.temp-20)/15.f + n(rng)*0.3f, -1.f,1.f);
+        v.d[P_FRIC] = std::clamp(obj.fric + n(rng)*0.1f, 0.f,1.f);
+        v.d[P_TEX] = std::clamp(obj.rough + n(rng)*0.2f, 0.f,1.f);
+        v.d[P_TAP_S] = std::clamp(obj.snd/5000.f + n(rng), 0.f,1.f);
+        v.d[P_TAP_R] = std::clamp(obj.cor + n(rng)*0.1f, 0.f,1.f);
+        float resist = std::clamp(obj.E/100 * (obj.wall/5) + n(rng), 0.f,1.f);
+        float deform = std::clamp(1.f/(obj.E+1)*5 + n(rng), 0.f,1.f);
+        float brit_r = obj.E/(obj.ult+1);
+        float thick_p = std::min(obj.wall/10.f,1.f);
+        float break_r = (1-brit_r*0.5f)*(0.3f+0.7f*thick_p);
+        bool broke = (0.8f > break_r) && (break_r < 0.5f);
+        float spring = broke?0:std::clamp(obj.elim*10 + n(rng), 0.f,1.f);
+        v.d[P_SQ_R] = resist; v.d[P_SQ_D] = deform; v.d[P_SQ_SP] = spring; v.d[P_SQ_B] = broke?1.f:0.f;
+        v.d[D_BRIT] = broke?resist*(1-break_r):0;
+        v.d[D_TOUGH] = !broke?resist*(1-deform):0;
+        v.d[D_SOFT] = (1-resist)*deform*spring;
+        v.d[D_SLIP] = (1-v.d[P_FRIC])*0.7f;
+        if(v.d[V_SIZE]>0.01f) v.d[D_DENS] = v.d[P_W]/(v.d[V_SIZE]+0.01f);
+        v.d[P_PUSH_F] = std::clamp(obj.fric*obj.dens*0.3f + n(rng), 0.f,1.f);
+        v.d[P_SLIDE_S] = std::clamp(obj.fric*(1-obj.rough) + n(rng)*0.1f, 0.f,1.f);
+        obj_data[name] = obj;
+    }
+    void experience(const std::string& act, const std::string& target, bool success) {
+        ++time;
+        ensure(target);
+        trajectories.push_back({act,target,success?1.f:-1.f,time});
+        tried[act].insert(target);
+        int odim = act=="drop"?O_DROP : act=="throw"?O_THROW : act=="squeeze"?O_SQ : act=="push"?O_PUSH : -1;
+        if(odim>=0) {
+            float cnt = positions[target].d[M_EXP];
+            positions[target].d[odim] = (positions[target].d[odim]*cnt + (success?1:-1))/(cnt+1);
+        }
+        positions[target].d[M_EXP] += 1;
+        positions[target].d[M_FAM] += 0.05f;
+        // update Gaussian process
+        if(obj_data.count(target)) {
+            QVec x; x.d[D_DENS]=obj_data[target].dens; x.d[P_W]=positions[target].d[P_W]; x.d[D_BRIT]=positions[target].d[D_BRIT];
+            auto& gp = gps[act];
+            gp.X.push_back(x); gp.Y.push_back(success?1:-1);
+            if(gp.X.size() > cfg.max_gp_points) { gp.X.erase(gp.X.begin()); gp.Y.erase(gp.Y.begin()); }
+        }
+    }
+    struct PhysPred { bool success; float conf; float mean, var; };
+    PhysPred predict(const std::string& act, const std::string& target) {
+        if(!obj_data.count(target)) return {false,0,0,1};
+        QVec x; x.d[D_DENS]=obj_data[target].dens; x.d[P_W]=positions[target].d[P_W]; x.d[D_BRIT]=positions[target].d[D_BRIT];
+        auto it = gps.find(act);
+        if(it==gps.end()) return {false,0,0,1};
+        int n = it->second.X.size();
+        if(n==0) return {false,0,0,1};
+        std::vector<float> k(n); float sumk=0;
+        for(int i=0;i<n;++i) {
+            k[i]=std::exp(-it->second.X[i].dist_sq(x)/(2*cfg.sigma*cfg.sigma));
+            sumk+=k[i];
+        }
+        if(sumk==0) return {false,0,0,1};
+        float mean=0; for(int i=0;i<n;++i) mean+=k[i]*it->second.Y[i];
+        mean/=sumk;
+        float var = 1.0 - (k[0]*k[0])/(std::exp(-it->second.X[0].dist_sq(it->second.X[0])/(2*cfg.sigma*cfg.sigma))+0.1f);
+        return {mean>0, std::min(1.f,std::abs(mean)), mean, std::max(0.f,var)};
+    }
+
+    // ---------- CAUSAL ----------
+    void observe(const std::string& cause, const std::string& effect, float strength=1) {
+        ensure(cause); ensure(effect);
+        causal_links.push_back({cause,effect,strength,time});
+        QVec dir = positions[effect] - positions[cause];
+        causal_fwd[cause].push_back({effect,dir});
+        causal_rev[effect].push_back({cause, positions[cause]-positions[effect]});
+        // allocate a new context dimension for this pair
+        int ctx = reg_next++;
+        float avg = (positions[cause].d[ctx] + positions[effect].d[ctx]) * 0.5f;
+        positions[cause].d[ctx] += (avg - positions[cause].d[ctx]) * 0.2f;
+        positions[effect].d[ctx] += (avg - positions[effect].d[ctx]) * 0.2f;
+    }
+    struct CausalPred { bool causes; float conf; std::vector<std::string> chain; };
+    CausalPred predict_causal(const std::string& cause, const std::string& effect, int depth=cfg.causal_depth) {
+        struct State { std::string node; std::vector<std::string> path; };
+        std::queue<State> q; std::unordered_set<std::string> vis;
+        q.push({cause,{cause}});
+        while(!q.empty()) {
+            auto st=q.front(); q.pop();
+            if(vis.count(st.node)) continue;
+            vis.insert(st.node);
+            if(st.node==effect) return {true, 1.f/(1+st.path.size()), st.path};
+            auto it=causal_fwd.find(st.node);
+            if(it!=causal_fwd.end()) for(auto& [nxt,_] : it->second) if(!vis.count(nxt)) {
+                auto p=st.path; p.push_back(nxt); q.push({nxt,p});
+            }
+        }
+        return {false,0,{cause}};
+    }
+
+    // ---------- MEMORY ----------
+    void remember(const std::vector<std::string>& tokens) {
+        for(auto& t:tokens) if(positions.count(t)) deposit(positions[t], 1);
+    }
+    std::vector<std::pair<std::string,float>> recall(const std::vector<std::string>& tokens, int top=5) {
+        std::vector<std::pair<std::string,float>> out;
+        for(auto& t:tokens) if(positions.count(t)) {
+            float e = field_energy(positions[t], cfg.decay_rate);
+            if(e>0.01f) out.push_back({t,e});
+        }
+        std::sort(out.begin(),out.end(),[](auto& a,auto& b){return a.second>b.second;});
+        if((int)out.size()>top) out.resize(top);
+        return out;
+    }
+
+    // ---------- META LEARNING ----------
+    void reflect() {
+        // concept spread -> add compacting dimension
+        for(auto& [c, cen] : concept_centroids) {
+            if(concept_words[c].size()<3) continue;
+            float avg_dist=0;
+            for(auto& w : concept_words[c]) avg_dist += positions[w].dist_sq(cen);
+            avg_dist /= concept_words[c].size();
+            if(avg_dist > cfg.concept_spread) {
+                int new_dim = reg_next++;
+                for(auto& w : concept_words[c]) {
+                    float dist = positions[w].dist_sq(cen);
+                    positions[w].d[new_dim] = 1.0f / (1.0f+dist);
+                }
+                printf("[Meta] Added dimension %d to compact concept '%s'\n", new_dim, c.c_str());
+            }
+        }
+    }
+
+    // ---------- CHAT & REASONING ----------
+    std::string chat(const std::string& text) {
+        auto toks = split(text);
+        if(toks.empty()) return "?";
+        if(toks[0]=="why" && toks.size()>=3) {
+            auto pred = predict_causal(toks[1], toks[2]);
+            if(pred.causes) return "Because: " + join(pred.chain, " → ");
+            else return "I don't know why " + toks[1] + " causes " + toks[2];
+        }
+        if(toks[0]=="what" && toks[1]=="if" && toks.size()>=3) {
+            auto it = causal_fwd.find(toks[2]);
+            if(it==causal_fwd.end()) return "No known effects of " + toks[2];
+            std::string out = "If " + toks[2] + " then ";
+            for(auto& [e,_] : it->second) out += e + " ";
+            return out;
+        }
+        auto sc = classify(toks);
+        if(sc.best.empty()) return "I don't understand.";
+        auto gen = generate(toks);
+        return join(gen, " ");
+    }
+
+    void summary() {
+        printf("=== SMART AI ===\n");
+        printf("Entities: %lu  Concepts: %lu  Traj: %lu  Causal: %lu\n", positions.size(), concept_centroids.size(), trajectories.size(), causal_links.size());
+        printf("Dimensions used: %d (0‑43 fixed, %d dynamic)\n", reg_next, reg_next-44);
+        printf("Memory deposits: %lu\n", deposits.size());
+    }
+
+    // ---------- Getters for benchmarks ----------
+    const auto& get_positions() const { return positions; }
+    const auto& get_concept_centroids() const { return concept_centroids; }
+    const auto& get_causal_fwd() const { return causal_fwd; }
+    const auto& get_obj_data() const { return obj_data; }
+
+private:
+    // ---------- core data ----------
+    std::unordered_map<std::string, QVec> positions;
+    std::unordered_map<std::string, QVec> concept_centroids;
+    std::unordered_map<std::string, std::vector<std::string>> concept_words;
+    std::unordered_map<std::string, float> concept_total;
+    std::unordered_map<std::string, std::unordered_map<std::string,float>> word_cprobs;
+    // physics
+    std::unordered_map<std::string, PhysObj> obj_data;
+    struct GP { std::vector<QVec> X; std::vector<float> Y; };
+    std::unordered_map<std::string, GP> gps;
+    std::vector<std::tuple<std::string,std::string,float,int>> trajectories; // action,target,outcome,ts
+    std::unordered_map<std::string, std::unordered_set<std::string>> tried;
+    // causal
+    std::vector<std::tuple<std::string,std::string,float,int>> causal_links;
+    std::unordered_map<std::string, std::vector<std::pair<std::string,QVec>>> causal_fwd, causal_rev;
+    // memory
+    struct Deposit { QVec pos; float weight; int ts; };
+    std::vector<Deposit> deposits;
+    struct pair_hash { 
+        template<typename T1,typename T2> std::size_t operator()(const std::pair<T1,T2>& p) const {
+            return std::hash<T1>()(p.first) ^ std::hash<T2>()(p.second);
+        }
+    };
+    std::unordered_map<std::pair<int,int>, std::vector<int>, pair_hash> grid;
+    int time;
+    int reg_next; // next available dynamic dimension index (starts at 44)
+
+    // helpers
+    void ensure(const std::string& w) {
+        if(positions.count(w)) return;
+        QVec p;
+        std::mt19937 rng(std::hash<std::string>{}(w));
+        std::normal_distribution<float> nd(0,0.3f);
+        p.d[TX] = nd(rng); p.d[TY] = nd(rng);
+        positions[w] = p;
+    }
+    void deposit(const QVec& pos, float weight) {
+        deposits.push_back({pos, weight, time});
+        int ix = (int)(pos.d[TX] / cfg.grid_cell);
+        int iy = (int)(pos.d[TY] / cfg.grid_cell);
+        grid[{ix,iy}].push_back(deposits.size()-1);
+    }
+    float field_energy(const QVec& pos, float decay) const {
+        int ix = (int)(pos.d[TX] / cfg.grid_cell);
+        int iy = (int)(pos.d[TY] / cfg.grid_cell);
+        float total=0;
+        for(int dx=-1;dx<=1;++dx) for(int dy=-1;dy<=1;++dy) {
+            auto it = grid.find({ix+dx, iy+dy});
+            if(it!=grid.end()) for(int idx : it->second) {
+                const auto& d = deposits[idx];
+                float age = time - d.ts;
+                total += d.weight * std::exp(-decay * age) * std::exp(-d.pos.dist_sq(pos) / (4*cfg.sigma*cfg.sigma));
+            }
+        }
+        return total;
+    }
+};
+
+// ======================= MATERIAL DATABASE =======================
+struct MatDef {
+    const char* name; float r,g,b,shine,tex,transp; bool round; int sz;
+    float dens,yld,ult,E,elim,wall,fric,rough,snd,cor,temp;
+};
+MatDef MATS[] = {
+    {"glass",0.8f,0.9f,0.95f,0.9f,0,0.6f,1,10,2.5f,30,40,70,0.001f,2,0.2f,0,4000,0.65f,18},
+    {"rubber",0.9f,0.2f,0.2f,0.1f,0.4f,0,1,10,1.1f,5,15,0.05f,0.5f,10,0.9f,0.6f,500,0.8f,24},
+    {"wood",0.55f,0.35f,0.2f,0.1f,0.6f,0,0,11,0.6f,40,80,12,0.01f,10,0.45f,0.5f,800,0.35f,23},
+    {"metal",0.75f,0.75f,0.8f,0.85f,0,0,0,10,7.8f,250,400,200,0.002f,3,0.22f,0.1f,3000,0.35f,16},
+};
+const int N_MATS = 4;
+PhysObj make_obj(int id, std::mt19937& rng) {
+    PhysObj o; int mi=rng()%N_MATS; auto& m=MATS[mi];
+    o.name = std::string(m.name)+"_"+std::to_string(id); o.material=m.name;
+    std::normal_distribution<float> cn(0,0.08f);
+    o.r=std::clamp(m.r+cn(rng),0.f,1.f); o.g=std::clamp(m.g+cn(rng),0.f,1.f); o.b=std::clamp(m.b+cn(rng),0.f,1.f);
+    o.shine=m.shine; o.tex=m.tex; o.transp=m.transp; o.round=m.round; o.size=m.sz+(rng()%3-1);
+    o.dens=m.dens; o.yld=m.yld; o.ult=m.ult; o.E=m.E; o.elim=m.elim; o.wall=m.wall;
+    o.fric=m.fric; o.rough=m.rough; o.snd=m.snd; o.cor=m.cor; o.temp=m.temp;
+    return o;
+}
+// Image rendering (simplified)
+void Image::circle(int cx,int cy,int rad,float r,float g,float b,float a) {
+    for(int y=0;y<IMG_H;++y) for(int x=0;x<IMG_W;++x) {
+        float dx=x-cx,dy=y-cy;
+        if(dx*dx+dy*dy<=rad*rad) {
+            px[y][x].r=px[y][x].r*(1-a)+r*a;
+            px[y][x].g=px[y][x].g*(1-a)+g*a;
+            px[y][x].b=px[y][x].b*(1-a)+b*a;
+        }
+    }
+}
+void Image::rect(int x0,int y0,int x1,int y1,float r,float g,float b,float a) {
+    for(int y=std::max(0,y0);y<std::min(IMG_H,y1);++y) for(int x=std::max(0,x0);x<std::min(IMG_W,x1);++x) {
+        px[y][x].r=px[y][x].r*(1-a)+r*a;
+        px[y][x].g=px[y][x].g*(1-a)+g*a;
+        px[y][x].b=px[y][x].b*(1-a)+b*a;
+    }
+}
+void Image::highlight(int cx,int cy,int rad,float intens) {
+    for(int y=0;y<IMG_H;++y) for(int x=0;x<IMG_W;++x) {
+        float dx=x-cx,dy=y-cy,d2=dx*dx+dy*dy;
+        if(d2<rad*rad) { float f=1-std::sqrt(d2)/rad; float b=f*f*intens;
+            px[y][x].r=std::min(1.f,px[y][x].r+b);
+            px[y][x].g=std::min(1.f,px[y][x].g+b);
+            px[y][x].b=std::min(1.f,px[y][x].b+b);
+        }
+    }
+}
+void Image::noise(std::mt19937& rng,float amt) {
+    std::normal_distribution<float> n(0,amt);
+    for(int y=0;y<IMG_H;++y) for(int x=0;x<IMG_W;++x) {
+        px[y][x].r=std::clamp(px[y][x].r+n(rng),0.f,1.f);
+        px[y][x].g=std::clamp(px[y][x].g+n(rng),0.f,1.f);
+        px[y][x].b=std::clamp(px[y][x].b+n(rng),0.f,1.f);
+    }
+}
+Image PhysObj::render(std::mt19937& rng) const {
+    Image img; img.clear(0.4f,0.4f,0.45f);
+    int cx=IMG_W/2,cy=IMG_H/2; float a=1-transp*0.7f;
+    if(round) img.circle(cx,cy,size,r,g,b,a);
+    else img.rect(cx-size,cy-size*2/3,cx+size,cy+size*2/3,r,g,b,a);
+    if(shine>0.3f) img.highlight(cx-size/3,cy-size/3,size/2,shine);
+    img.noise(rng,0.03f);
+    return img;
+}
+
+// ======================= BENCHMARKS =======================
+void benchmark_text_classification(SmartAI& ai, std::mt19937& rng) {
+    printf("\n=== Text Classification Benchmark ===\n");
+    std::vector<std::pair<std::string, std::string>> dataset = {
+        {"sports", "team scored goal"}, {"sports", "player kicked ball"}, {"sports", "coach led victory"},
+        {"sports", "crowd cheered goal"}, {"sports", "athlete broke record"}, {"sports", "game was exciting"},
+        {"sports", "scoreboard lit up"}, {"sports", "referee blew whistle"},
+        {"science", "researcher discovered species"}, {"science", "experiment confirmed hypothesis"},
+        {"science", "telescope observed galaxy"}, {"science", "vaccine showed promise"},
+        {"science", "cell divided under microscope"}, {"science", "lab equipment was calibrated"},
+        {"science", "data analysis proved theory"}, {"science", "particle collider detected anomaly"},
+        {"politics", "senator voted legislation"}, {"politics", "president signed order"},
+        {"politics", "governor declared emergency"}, {"politics", "campaign speech rallied voters"},
+        {"politics", "debate focused on economy"}, {"politics", "committee approved bill"},
+        {"technology", "software deployed update"}, {"technology", "algorithm processed data"},
+        {"technology", "startup launched app"}, {"technology", "hardware accelerated computation"},
+        {"technology", "network secured against attack"}, {"technology", "cloud storage expanded"},
+        {"music", "guitarist played solo"}, {"music", "orchestra performed symphony"},
+        {"music", "singer released album"}, {"music", "drummer kept rhythm steady"},
+        {"music", "pianist played concerto"}, {"music", "crowd sang along"}
+    };
+    int train_size = (int)(dataset.size() * 0.8);
+    std::shuffle(dataset.begin(), dataset.end(), rng);
+    std::vector<std::pair<std::string, std::vector<std::string>>> train_data, test_data;
+    for (size_t i = 0; i < dataset.size(); ++i) {
+        auto tokens = split(dataset[i].second);
+        if (i < train_size) train_data.push_back({dataset[i].first, tokens});
+        else test_data.push_back({dataset[i].first, tokens});
+    }
+    ai.train(train_data);
+    int correct = 0;
+    for (auto& [cat, toks] : test_data) {
+        auto res = ai.classify(toks);
+        if (res.best == cat) ++correct;
+    }
+    printf("Accuracy: %.2f%% (%d/%d)\n", 100.0 * correct / test_data.size(), correct, (int)test_data.size());
+}
+
+void benchmark_physics_prediction(SmartAI& ai, std::mt19937& rng) {
+    printf("\n=== Physics Prediction Benchmark ===\n");
+    int total_objects = 500;
+    int train_count = 400;
+    std::vector<PhysObj> train_objs, test_objs;
+    for (int i = 0; i < total_objects; ++i) {
+        auto obj = make_obj(i, rng);
+        if (i < train_count) train_objs.push_back(obj);
+        else test_objs.push_back(obj);
+    }
+    for (auto& obj : train_objs) {
+        ai.perceive(obj.name, obj, rng);
+        bool fragile = obj.fragility() < 0.5f;
+        ai.experience("drop", obj.name, fragile);
+        ai.experience("throw", obj.name, fragile);
+    }
+    int correct_drop = 0, correct_throw = 0;
+    for (auto& obj : test_objs) {
+        ai.perceive(obj.name, obj, rng);
+        bool fragile = obj.fragility() < 0.5f;
+        auto pred_drop = ai.predict("drop", obj.name);
+        auto pred_throw = ai.predict("throw", obj.name);
+        if (pred_drop.success == fragile) ++correct_drop;
+        if (pred_throw.success == fragile) ++correct_throw;
+    }
+    printf("Drop accuracy: %.2f%% (%d/%d)\n", 100.0 * correct_drop / test_objs.size(), correct_drop, (int)test_objs.size());
+    printf("Throw accuracy: %.2f%% (%d/%d)\n", 100.0 * correct_throw / test_objs.size(), correct_throw, (int)test_objs.size());
+}
+
+void benchmark_causal_chains(SmartAI& ai) {
+    printf("\n=== Causal Chain Benchmark ===\n");
+    std::vector<std::pair<std::string, std::string>> edges = {
+        {"a","b"}, {"b","c"}, {"c","d"},
+        {"x","y"}, {"y","z"},
+        {"c","z"}
+    };
+    for (auto& [c, e] : edges) ai.observe(c, e);
+    struct Test { std::string cause, effect; bool expected; int min_edges; };
+    std::vector<Test> tests = {
+        {"a","b", true, 1}, {"a","d", true, 3}, {"a","z", true, 3},
+        {"x","z", true, 2}, {"b","x", false, 0}, {"d","a", false, 0},
+    };
+    int correct = 0;
+    for (auto& t : tests) {
+        auto res = ai.predict_causal(t.cause, t.effect);
+        bool ok = (res.causes == t.expected);
+        if (ok && t.expected && (int)res.chain.size() - 1 != t.min_edges) ok = false;
+        if (ok) ++correct;
+        else printf("  Failed: %s -> %s (expected %s, got %s, chain length %zu)\n",
+                    t.cause.c_str(), t.effect.c_str(), t.expected ? "yes" : "no",
+                    res.causes ? "yes" : "no", res.chain.size());
+    }
+    printf("Causal accuracy: %.2f%% (%d/%d)\n", 100.0 * correct / tests.size(), correct, (int)tests.size());
+}
+
+void benchmark_memory_recall(SmartAI& ai) {
+    printf("\n=== Memory Recall Benchmark ===\n");
+    std::vector<std::pair<std::string, std::string>> pairs = {
+        {"apple","fruit"}, {"car","vehicle"}, {"dog","animal"}, {"blue","color"}, {"happy","emotion"}
+    };
+    for (auto& [k, v] : pairs) {
+        ai.remember({k, v});
+    }
+    int failed = 0;
+    for (auto& [k, v] : pairs) {
+        auto rec = ai.recall({k}, 1);
+        if (rec.empty() || rec[0].first != v) {
+            ++failed;
+            printf("  Recall failed for '%s' -> expected '%s', got '%s'\n",
+                   k.c_str(), v.c_str(), rec.empty() ? "nothing" : rec[0].first.c_str());
+        }
+    }
+    if (failed == 0) printf("All pairs recalled correctly.\n");
+    else printf("%d failures out of %d\n", failed, (int)pairs.size());
+}
+
+void benchmark_integrated_reasoning(SmartAI& ai, std::mt19937& rng) {
+    printf("\n=== Integrated Reasoning Benchmark ===\n");
+    // Many examples for each material
+    std::vector<std::pair<std::string, std::vector<std::string>>> text_data = {
+        {"glass", split("glass is transparent")}, {"glass", split("glass can shatter")},
+        {"glass", split("windows are made of glass")}, {"glass", split("glass is fragile")},
+        {"rubber", split("rubber is bouncy")}, {"rubber", split("rubber is elastic")},
+        {"rubber", split("tires are made of rubber")}, {"rubber", split("rubber does not break easily")},
+        {"wood", split("wood is solid")}, {"wood", split("wood comes from trees")},
+        {"wood", split("furniture is often wood")}, {"wood", split("wood can splinter")},
+        {"metal", split("metal is hard")}, {"metal", split("metal conducts electricity")},
+        {"metal", split("tools are often metal")}, {"metal", split("metal is strong")},
+    };
+    ai.train(text_data);
+    std::unordered_map<std::string, std::string> material_to_obj;
+    for (int i = 0; i < N_MATS; ++i) {
+        auto obj = make_obj(i, rng);
+        obj.material = MATS[i].name;
+        ai.perceive(obj.name, obj, rng);
+        bool fragile = obj.fragility() < 0.5f;
+        ai.experience("drop", obj.name, fragile);
+        material_to_obj[obj.material] = obj.name;
+    }
+    std::vector<std::string> queries = {"drop glass", "drop rubber", "drop wood", "drop metal"};
+    for (auto& q : queries) {
+        auto toks = split(q);
+        auto cls = ai.classify(toks);
+        if (cls.best.empty()) {
+            printf("  '%s' -> unknown material\n", q.c_str());
+            continue;
+        }
+        auto it = material_to_obj.find(cls.best);
+        if (it == material_to_obj.end()) {
+            printf("  No object for material '%s'\n", cls.best.c_str());
+            continue;
+        }
+        auto pred = ai.predict("drop", it->second);
+        printf("  '%s' -> %s (conf=%.2f)\n", q.c_str(), pred.success ? "break" : "survive", pred.conf);
+    }
+}
+
+void benchmark_meta_learning(SmartAI& ai, std::mt19937& rng) {
+    printf("\n=== Meta‑Learning Benchmark ===\n");
+    float saved_threshold = cfg.concept_spread;
+    cfg.concept_spread = 0.2f;
+    std::vector<std::string> similar_words = {"big", "large", "huge", "enormous", "gigantic", "massive", "colossal"};
+    for (auto& w : similar_words) {
+        ai.add_example("size", {w});
+    }
+    ai.reflect();
+    cfg.concept_spread = saved_threshold;
+    printf("Meta‑learning completed. (If you saw a dimension addition, it worked.)\n");
+}
+
+// ======================= MAIN =======================
+int main() {
+    // Create separate AI instances for each benchmark to avoid interference
+    std::mt19937 rng(42);
+
+    SmartAI ai_text;
+    benchmark_text_classification(ai_text, rng);
+
+    SmartAI ai_physics;
+    benchmark_physics_prediction(ai_physics, rng);
+
+    SmartAI ai_causal;
+    benchmark_causal_chains(ai_causal);
+
+    SmartAI ai_memory;
+    benchmark_memory_recall(ai_memory);
+
+    SmartAI ai_integrated;
+    benchmark_integrated_reasoning(ai_integrated, rng);
+
+    SmartAI ai_meta;
+    benchmark_meta_learning(ai_meta, rng);
+
+    // Summary for the last AI (meta) – you can change to any
+    ai_meta.summary();
+
+    printf("\n=== Interactive Demo ===\n");
+    SmartAI demo_ai;
+    demo_ai.train({
+        {"sports", split("team scored goal")}, {"sports", split("player kicked ball")},
+        {"science", split("researcher discovered species")}, {"science", split("experiment confirmed hypothesis")},
+        {"rain", split("rain makes ground wet")}, {"wet", split("wet ground causes slipping")},
+        {"slipping", split("slipping causes falling")},
+    });
+    demo_ai.observe("rain", "wet");
+    demo_ai.observe("wet", "slip");
+    demo_ai.observe("slip", "fall");
+
+    printf("Q: why rain fall?  A: %s\n", demo_ai.chat("why rain fall").c_str());
+    printf("Q: what if rain?   A: %s\n", demo_ai.chat("what if rain").c_str());
+
+    PhysObj obj = make_obj(0, rng);
+    demo_ai.perceive("demo", obj, rng);
+    demo_ai.experience("drop", "demo", obj.fragility() < 0.5f);
+    auto pred = demo_ai.predict("drop", "demo");
+    printf("Drop prediction: %s (conf=%.2f, mean=%.2f)\n", pred.success ? "break" : "survive", pred.conf, pred.mean);
+
+    demo_ai.reflect();
+    demo_ai.summary();
+
+    return 0;
+}
